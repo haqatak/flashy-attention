@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mlx-flash-attention"
+version = "0.0.1"
+description = "Flash Attention in MLX"
+readme = "README.md"
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+]
+dependencies = ["mlx", "numpy"]
+
+[project.urls]
+"Homepage" = "https://github.com/osama-ata/metal-flash-attention-py"
+"Bug Tracker" = "https://github.com/osama-ata/metal-flash-attention-py/issues"

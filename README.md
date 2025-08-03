@@ -2,7 +2,49 @@
 
 This repository ports the official implementation of [FlashAttention](https://github.com/Dao-AILab/flash-attention) to Apple silicon. It is a minimal, maintainable set of source files that reproduces the FlashAttention algorithm.
 
-## Documentation
+## Python/MLX Port
+
+This repository now includes a Python port of the FlashAttention algorithm using Apple's MLX framework. This implementation provides a pure Python alternative to the original Swift/Metal version, allowing for easier integration with Python-based machine learning projects on Apple Silicon.
+
+### Usage
+
+#### Environment Setup
+
+It is recommended to use a virtual environment. This project uses `uv` for environment and package management.
+
+1. **Create a virtual environment:**
+
+    ```bash
+    uv venv
+    ```
+
+2. **Activate the virtual environment:**
+
+    ```bash
+    source .venv/bin/activate
+    ```
+
+3. **Install dependencies:**
+
+    ```bash
+    uv pip install -e .
+    ```
+
+#### Running Tests
+
+To verify the implementation, you can run the provided tests:
+
+```bash
+python -m tests.test_attention
+```
+
+The tests compare the output of the custom FlashAttention implementation against a standard attention implementation to ensure numerical correctness.
+
+---
+
+## Original Swift/Metal Documentation
+
+### Documentation
 
 Single-headed attention only, to focus on the core bottlenecks of different attention algorithms (register pressure, parallelism). With the basic algorithm done correctly, it should be comparatively trivial to add customizations like block sparsity.
 
@@ -18,9 +60,9 @@ The end result is a consistent 4400 gigainstructions per second on M1 Max (83% A
 
 ![M4_Image.png](./Documentation/M4_Image.png)
 
-Raw Data: https://docs.google.com/spreadsheets/d/1Xf4jrJ7e19I32J1IWIekGE9uMFTeZKoOpQ6hlUoh-xY/edit?usp=sharing
+Raw Data: <https://docs.google.com/spreadsheets/d/1Xf4jrJ7e19I32J1IWIekGE9uMFTeZKoOpQ6hlUoh-xY/edit?usp=sharing>
 
-## Quantifying Performance
+### Quantifying Performance
 
 In the AI field, performance is most often reported in giga-floating point operations per second (GFLOPS). This metric reflects a simplified model of performance, that every instruction occurs in GEMM. As hardware has advanced from early FPUs to modern vector processors, the most common floating-point operations were fused into a single instruction. Fused multiply-add (FMA). When one multiplies two 100x100 matrices, 1 million FMA instructions are issued. Why must we treat this FMA as two separate instructions?
 
@@ -34,7 +76,7 @@ Instead of gigaflops, I use gigainstructions to understand how well the shader i
 | Forward Attention | `(2D + 5) * N^2` |
 | Backward Naive Attention | `4D * N^2` |
 | Backward FlashAttention | `(5D + 5) * N^2` |
-| FWD + BWD Combined | `(7D + 10) * N^2` | 
+| FWD + BWD Combined | `(7D + 10) * N^2` |
 
 Due to the complexity of FP32 atomics, MFA used a different approach for backward pass. This one has higher compute cost. It splits the backward pass into two separate kernels: `dQ` and `dK/dV`. A dropdown shows the pseudocode. Compare this to one of the algorithms in the Flash1, Flash2, or Flash3 papers.
 
@@ -43,7 +85,7 @@ Due to the complexity of FP32 atomics, MFA used a different approach for backwar
 | Forward | `(2D + 5) * N^2` |
 | Backward dQ | `(3D + 5) * N^2` |
 | Backward dK/dV | `(4D + 5) * N^2` |
-| FWD + BWD Combined | `(9D + 15) * N^2` | 
+| FWD + BWD Combined | `(9D + 15) * N^2` |
 
 <details>
 <summary>Algorithm Pseudocode</summary>
@@ -101,7 +143,7 @@ Due to the complexity of FP32 atomics, MFA used a different approach for backwar
 
 </details>
 
-Performance is measured by calculating the amount of compute work, then dividing by seconds. The end result is "gigainstructions per second". Next, we need a roofline model. The table below shows rooflines for GINSTRS, calculated as half of GFLOPS. ALU utilization is (actual gigainstructions per second) / (expected gigainstructions per second). For example, M1 Max typically achieves 80% ALU utilization with mixed precision. 
+Performance is measured by calculating the amount of compute work, then dividing by seconds. The end result is "gigainstructions per second". Next, we need a roofline model. The table below shows rooflines for GINSTRS, calculated as half of GFLOPS. ALU utilization is (actual gigainstructions per second) / (expected gigainstructions per second). For example, M1 Max typically achieves 80% ALU utilization with mixed precision.
 
 There are limits to this model. It breaks down with the M3 generation at small head dimensions. Different compute units might be utilized simultaneously, making the apparent utilization over 100%. For the most part, the benchmark provides an accurate model of how much performance is left on the table.
 
@@ -191,7 +233,7 @@ Despite issuing more computations, Apple hardware is training transformers <b>fa
 
 Perhaps the main repository should try the algorithm that avoids FP32 atomics and deliberately spills registers when they cannot fit in the GPU core. This seems unlikely, as they have hard-coded support for a small subset of the possible problem sizes. The motivation seems to be supporting the most common models, where `D` is a power of 2, and less than 128. For anything else, users need to rely on alternative fallback implementations (e.g. the MFA repository), which might use a completely different underlying algorithm.
 
-## Usage
+### Usage
 
 ### Setting Up Workflow
 
