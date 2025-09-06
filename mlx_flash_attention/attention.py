@@ -1,6 +1,8 @@
 import mlx.core as mx
 
 
+from typing import Tuple
+
 def flash_attention_forward(
     q: mx.array,
     k: mx.array,
@@ -8,6 +10,9 @@ def flash_attention_forward(
     mask: mx.array = None,
     scale: float = None,
     causal: bool = False,
+    q_lens: mx.array = None,
+    k_lens: mx.array = None,
+    window_size: Tuple[int, int] = (-1, -1),
 ) -> tuple[mx.array, mx.array]:
     """
     An implementation of flash attention.
@@ -22,6 +27,12 @@ def flash_attention_forward(
         scale (float, optional): The scale factor for the attention scores.
             Defaults to 1 / sqrt(D).
         causal (bool, optional): If True, apply a causal mask. Defaults to False.
+        q_lens (mx.array, optional): The sequence lengths of the queries, in B.
+            Defaults to None.
+        k_lens (mx.array, optional): The sequence lengths of the keys, in B.
+            Defaults to None.
+        window_size (Tuple[int, int], optional): The size of the sliding window.
+            Defaults to (-1, -1), which means no sliding window.
 
     Returns:
         (mx.array, mx.array): The output vectors and the log-sum-exp of the
@@ -34,12 +45,44 @@ def flash_attention_forward(
         if N != M:
             raise ValueError("Causal masking requires query and key sequence lengths to be equal.")
 
+    if q_lens is not None and k_lens is not None:
+        q_mask = mx.arange(N)[None, :] < q_lens[:, None]
+        k_mask = mx.arange(M)[None, :] < k_lens[:, None]
+        varlen_mask = q_mask[:, :, None] * k_mask[:, None, :]
+        varlen_mask = mx.where(varlen_mask, 0.0, float("-inf"))
+        if mask is not None:
+            mask = mask + varlen_mask
+        else:
+            mask = varlen_mask
+
+    if window_size[0] != -1 or window_size[1] != -1:
+        query_indices = mx.arange(N).reshape(-1, 1)
+        key_indices = mx.arange(M).reshape(1, -1)
+
+        if window_size[0] == -1:
+            lower_bound_mask = mx.full((N, M), True)
+        else:
+            lower_bound_mask = key_indices >= (query_indices - window_size[0])
+
+        if window_size[1] == -1:
+            upper_bound_mask = mx.full((N, M), True)
+        else:
+            upper_bound_mask = key_indices <= (query_indices + window_size[1])
+
+        sliding_window_mask = lower_bound_mask & upper_bound_mask
+        sliding_window_mask = mx.where(sliding_window_mask, 0.0, float("-inf"))
+
+        if mask is not None:
+            mask = mask + sliding_window_mask
+        else:
+            mask = sliding_window_mask
+
     scale = scale or 1.0 / mx.sqrt(D)
 
     # Online softmax statistics
     o = mx.zeros((B, N, D_v), dtype=q.dtype)
-    l = mx.zeros((B, N))
-    m = mx.full((B, N), -mx.inf)
+    l = mx.zeros((B, N), dtype=q.dtype)
+    m = mx.full((B, N), -mx.inf, dtype=q.dtype)
 
     # Tiling parameters
     # These would be tuned for performance on specific hardware.
