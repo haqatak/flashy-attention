@@ -7,6 +7,7 @@ def flash_attention_forward(
     v: mx.array,
     mask: mx.array = None,
     scale: float = None,
+    causal: bool = False,
 ) -> tuple[mx.array, mx.array]:
     """
     An implementation of flash attention.
@@ -15,9 +16,12 @@ def flash_attention_forward(
         q (mx.array): The query vectors, in B x N x D.
         k (mx.array): The key vectors, in B x M x D.
         v (mx.array): The value vectors, in B x M x D_v.
-        mask (mx.array, optional): The attention mask. Defaults to None.
+        mask (mx.array, optional): The attention mask. It should be an array that
+            can be broadcast to `(B, N, M)`. A value of 0 means attend, and a
+            large negative number (e.g., -1e9) means mask. Defaults to None.
         scale (float, optional): The scale factor for the attention scores.
             Defaults to 1 / sqrt(D).
+        causal (bool, optional): If True, apply a causal mask. Defaults to False.
 
     Returns:
         (mx.array, mx.array): The output vectors and the log-sum-exp of the
@@ -25,6 +29,10 @@ def flash_attention_forward(
     """
     B, N, D = q.shape
     _, M, D_v = v.shape
+
+    if causal:
+        if N != M:
+            raise ValueError("Causal masking requires query and key sequence lengths to be equal.")
 
     scale = scale or 1.0 / mx.sqrt(D)
 
@@ -53,6 +61,15 @@ def flash_attention_forward(
 
             # Compute attention scores
             s_ij = (q_i @ k_j.transpose(0, 2, 1)) * scale
+
+            if causal:
+                query_indices = mx.arange(i, i_end).reshape(-1, 1)
+                key_indices = mx.arange(j, j_end).reshape(1, -1)
+                causal_mask_block = key_indices > query_indices
+                s_ij = mx.where(causal_mask_block, float("-inf"), s_ij)
+
+            if mask is not None:
+                s_ij = s_ij + mask[:, i:i_end, j:j_end]
 
             # Online softmax update
             m_i_new = mx.maximum(m_i, mx.max(s_ij, axis=-1))

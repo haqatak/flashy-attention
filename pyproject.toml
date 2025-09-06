@@ -18,3 +18,6 @@ dependencies = ["mlx", "numpy"]
 [project.urls]
 "Homepage" = "https://github.com/osama-ata/metal-flash-attention-py"
 "Bug Tracker" = "https://github.com/osama-ata/metal-flash-attention-py/issues"
+
+[tool.setuptools]
+packages = ["mlx_flash_attention"]
