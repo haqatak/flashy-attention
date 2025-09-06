@@ -1,9 +1,0 @@
-LICENSE
-README.md
-pyproject.toml
-mlx_flash_attention/attention.py
-mlx_flash_attention.egg-info/PKG-INFO
-mlx_flash_attention.egg-info/SOURCES.txt
-mlx_flash_attention.egg-info/dependency_links.txt
-mlx_flash_attention.egg-info/requires.txt
-mlx_flash_attention.egg-info/top_level.txt

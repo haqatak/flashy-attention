@@ -10,7 +10,12 @@ This repository now includes a Python port of the FlashAttention algorithm using
 
 #### Environment Setup
 
-It is recommended to use a virtual environment. This project uses `uv` for environment and package management.
+It is recommended to use a virtual environment.
+
+<details>
+<summary>Using `uv` (Recommended)</summary>
+
+This project uses `uv` for environment and package management.
 
 1. **Create a virtual environment:**
 
@@ -29,6 +34,31 @@ It is recommended to use a virtual environment. This project uses `uv` for envir
     ```bash
     uv pip install -e .
     ```
+
+</details>
+
+<details>
+<summary>Using `pip` and `venv`</summary>
+
+1. **Create a virtual environment:**
+
+    ```bash
+    python -m venv .venv
+    ```
+
+2. **Activate the virtual environment:**
+
+    ```bash
+    source .venv/bin/activate
+    ```
+
+3. **Install dependencies:**
+
+    ```bash
+    pip install -e .
+    ```
+
+</details>
 
 #### Running Tests
 
