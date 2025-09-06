@@ -1,14 +1,18 @@
 import mlx.core as mx
+import mlx.nn as nn
 import numpy as np
+from mlx_flash_attention import FlashAttention
 from mlx_flash_attention.attention import (
     flash_attention_forward,
     flash_attention_backward,
 )
 
 
-def standard_attention(q, k, v, scale):
+def standard_attention(q, k, v, scale, mask=None):
     """A standard attention implementation."""
     s = (q @ k.transpose(0, 2, 1)) * scale
+    if mask is not None:
+        s = s + mask
     p = mx.softmax(s, axis=-1)
     return p @ v
 
@@ -67,6 +71,108 @@ def test_flash_attention_backward():
     assert mx.allclose(dV_flash, dV_standard, atol=1e-5, rtol=1e-6)
 
 
+def test_flash_attention_causal():
+    B = 1
+    N = 256
+    D = 64
+    D_v = 64
+
+    q = mx.random.normal((B, N, D))
+    k = mx.random.normal((B, N, D))
+    v = mx.random.normal((B, N, D_v))
+    scale = 1.0 / np.sqrt(D)
+
+    # Run flash attention with causal masking
+    o_flash, _ = flash_attention_forward(q, k, v, scale=scale, causal=True)
+
+    # Run standard attention with causal mask
+    mask = np.triu(np.full((N, N), -1e9), 1)
+    mask = mx.array(mask)
+    o_standard = standard_attention(q, k, v, scale, mask=mask)
+
+    # Check that the outputs are close
+    assert mx.allclose(o_flash, o_standard, atol=1e-5, rtol=1e-6)
+
+
+def test_flash_attention_mask():
+    B = 1
+    N = 256
+    M = 256
+    D = 64
+    D_v = 64
+
+    q = mx.random.normal((B, N, D))
+    k = mx.random.normal((B, M, D))
+    v = mx.random.normal((B, M, D_v))
+    scale = 1.0 / np.sqrt(D)
+    mask = mx.random.randint(0, 2, (B, N, M)) * -1e9
+
+    # Run flash attention with mask
+    o_flash, _ = flash_attention_forward(q, k, v, scale=scale, mask=mask)
+
+    # Run standard attention with mask
+    o_standard = standard_attention(q, k, v, scale, mask=mask)
+
+    # Check that the outputs are close
+    assert mx.allclose(o_flash, o_standard, atol=1e-5, rtol=1e-6)
+
+
+def standard_multi_head_attention(
+    q, k, v, d_model, num_heads, scale, q_proj, k_proj, v_proj, out_proj, mask=None, causal=False
+):
+    d_head = d_model // num_heads
+    B, N, D = q.shape
+    _, M, _ = k.shape
+
+    # Project and split heads
+    q = q_proj(q).reshape(B, N, num_heads, d_head).transpose(0, 2, 1, 3)
+    k = k_proj(k).reshape(B, M, num_heads, d_head).transpose(0, 2, 1, 3)
+    v = v_proj(v).reshape(B, M, num_heads, d_head).transpose(0, 2, 1, 3)
+
+    # Standard attention
+    if causal:
+        mask = np.triu(np.full((N, N), -1e9), 1)
+        mask = mx.array(mask)
+
+    if mask is not None:
+        mask = mx.expand_dims(mask, 1)
+        mask = mx.broadcast_to(mask, (B, num_heads, N, M))
+
+    output = standard_attention(q, k, v, scale, mask=mask)
+
+    # Reshape and project back
+    output = output.transpose(0, 2, 1, 3).reshape(B, N, D)
+    return out_proj(output)
+
+
+def test_multi_head_flash_attention():
+    B = 1
+    N = 256
+    D = 128
+    num_heads = 4
+
+    q = mx.random.normal((B, N, D))
+    k = mx.random.normal((B, N, D))
+    v = mx.random.normal((B, N, D))
+    scale = 1.0 / np.sqrt(D // num_heads)
+
+    # Flash attention
+    flash_attention = FlashAttention(D, num_heads)
+    o_flash = flash_attention(q, k, v)
+
+    # Standard multi-head attention
+    o_standard = standard_multi_head_attention(
+        q, k, v, D, num_heads, scale,
+        flash_attention.q_proj, flash_attention.k_proj, flash_attention.v_proj, flash_attention.out_proj
+    )
+
+    # Check that the outputs are close
+    assert mx.allclose(o_flash, o_standard, atol=1e-5, rtol=1e-6)
+
+
 if __name__ == "__main__":
     test_flash_attention_forward()
     test_flash_attention_backward()
+    test_flash_attention_causal()
+    test_flash_attention_mask()
+    test_multi_head_flash_attention()
