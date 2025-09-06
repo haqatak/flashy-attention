@@ -7,22 +7,18 @@ from typing import Tuple
 class FlashAttention(nn.Module):
     """
     An implementation of multi-head flash attention as a `mlx.nn.Module`.
+
+    This module expects the queries, keys, and values to be already projected
+    and split into heads.
     """
 
-    def __init__(self, d_model: int, num_heads: int, dropout_p: float = 0.0, dtype=mx.float32):
+    def __init__(self, num_heads: int, head_dim: int, dropout_p: float = 0.0, dtype=mx.float32):
         super().__init__()
-        if d_model % num_heads != 0:
-            raise ValueError("d_model must be divisible by num_heads")
-
-        self.d_model = d_model
         self.num_heads = num_heads
-        self.d_head = d_model // num_heads
+        self.head_dim = head_dim
         self.dtype = dtype
 
-        self.q_proj = nn.Linear(d_model, d_model)
-        self.k_proj = nn.Linear(d_model, d_model)
-        self.v_proj = nn.Linear(d_model, d_model)
-        self.out_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(num_heads * head_dim, num_heads * head_dim)
         self.dropout = nn.Dropout(p=dropout_p)
 
     def __call__(
@@ -36,12 +32,13 @@ class FlashAttention(nn.Module):
         k_lens: mx.array = None,
         q_scale: float = 1.0,
         window_size: Tuple[int, int] = (-1, -1),
+        deterministic: bool = False,
     ) -> mx.array:
         """
         Args:
-            queries (mx.array): The query vectors, in B x N x D.
-            keys (mx.array): The key vectors, in B x M x D.
-            values (mx.array): The value vectors, in B x M x D_v.
+            queries (mx.array): The query vectors, in B x N x num_heads x head_dim.
+            keys (mx.array): The key vectors, in B x M x num_heads x head_dim.
+            values (mx.array): The value vectors, in B x M x num_heads x head_dim.
             mask (mx.array, optional): The attention mask. Defaults to None.
             causal (bool, optional): If True, apply a causal mask. Defaults to False.
             q_lens (mx.array, optional): The sequence lengths of the queries, in B.
@@ -49,30 +46,35 @@ class FlashAttention(nn.Module):
             q_scale (float, optional): The scale factor for the queries. Defaults to 1.0.
             window_size (Tuple[int, int], optional): The size of the sliding window.
                 Defaults to (-1, -1), which means no sliding window.
+            deterministic (bool, optional): If True, use a fixed seed for dropout.
+                Defaults to False.
 
         Returns:
-            mx.array: The output vectors.
+            mx.array: The output vectors, in B x N x (num_heads * head_dim).
         """
-        B, N, D = queries.shape
-        _, M, _ = keys.shape
+        if deterministic:
+            mx.random.seed(0)
+
+        B, N, _, _ = queries.shape
+        _, M, _, _ = keys.shape
 
         queries = queries.astype(self.dtype)
         keys = keys.astype(self.dtype)
         values = values.astype(self.dtype)
 
-        # Project and split heads
-        q = self.q_proj(queries).reshape(B, N, self.num_heads, self.d_head).transpose(0, 2, 1, 3)
-        k = self.k_proj(keys).reshape(B, M, self.num_heads, self.d_head).transpose(0, 2, 1, 3)
-        v = self.v_proj(values).reshape(B, M, self.num_heads, self.d_head).transpose(0, 2, 1, 3)
+        # Transpose to (B, num_heads, N, head_dim)
+        q = queries.transpose(0, 2, 1, 3)
+        k = keys.transpose(0, 2, 1, 3)
+        v = values.transpose(0, 2, 1, 3)
 
         # Scale queries
         if q_scale != 1.0:
             q = q * q_scale
 
         # Reshape for flash attention
-        q = q.reshape(B * self.num_heads, N, self.d_head)
-        k = k.reshape(B * self.num_heads, M, self.d_head)
-        v = v.reshape(B * self.num_heads, M, self.d_head)
+        q = q.reshape(B * self.num_heads, N, self.head_dim)
+        k = k.reshape(B * self.num_heads, M, self.head_dim)
+        v = v.reshape(B * self.num_heads, M, self.head_dim)
 
         if q_lens is not None:
             q_lens = mx.expand_dims(q_lens, 1)
@@ -103,7 +105,8 @@ class FlashAttention(nn.Module):
         )
 
         # Reshape and project back
-        output = output.reshape(B, self.num_heads, N, self.d_head).transpose(0, 2, 1, 3).reshape(B, N, D)
+        output = output.reshape(B, self.num_heads, N, self.head_dim).transpose(0, 2, 1, 3)
+        output = output.reshape(B, N, self.num_heads * self.head_dim)
 
         # Apply output projection and dropout. Dropout is applied to the final output
         # of the attention layer, which is a common practice.

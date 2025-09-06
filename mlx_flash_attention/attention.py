@@ -1,6 +1,5 @@
 import mlx.core as mx
-
-
+import numpy as np
 from typing import Tuple
 
 def flash_attention_forward(
@@ -44,6 +43,12 @@ def flash_attention_forward(
     if causal:
         if N != M:
             raise ValueError("Causal masking requires query and key sequence lengths to be equal.")
+        causal_mask = np.triu(np.full((N, M), -1e9), 1)
+        causal_mask = mx.array(causal_mask, dtype=q.dtype)
+        if mask is not None:
+            mask = mask + causal_mask
+        else:
+            mask = causal_mask
 
     if q_lens is not None and k_lens is not None:
         q_mask = mx.arange(N)[None, :] < q_lens[:, None]
@@ -105,12 +110,6 @@ def flash_attention_forward(
             # Compute attention scores
             s_ij = (q_i @ k_j.transpose(0, 2, 1)) * scale
 
-            if causal:
-                query_indices = mx.arange(i, i_end).reshape(-1, 1)
-                key_indices = mx.arange(j, j_end).reshape(1, -1)
-                causal_mask_block = key_indices > query_indices
-                s_ij = mx.where(causal_mask_block, float("-inf"), s_ij)
-
             if mask is not None:
                 s_ij = s_ij + mask[:, i:i_end, j:j_end]
 
@@ -133,6 +132,100 @@ def flash_attention_forward(
     L = m + mx.log(l)
     return o, L
 
+
+def _flash_attention_varlen_single(q, k, v, scale, causal, window_size):
+    N, D = q.shape
+    M, D_v = v.shape
+
+    mask = None
+    if causal:
+        mask = np.triu(np.full((N, M), -1e9), 1)
+        mask = mx.array(mask, dtype=q.dtype)
+
+    if window_size[0] != -1 or window_size[1] != -1:
+        query_indices = mx.arange(N).reshape(-1, 1)
+        key_indices = mx.arange(M).reshape(1, -1)
+
+        if window_size[0] == -1:
+            lower_bound_mask = mx.full((N, M), True)
+        else:
+            lower_bound_mask = key_indices >= (query_indices - window_size[0])
+
+        if window_size[1] == -1:
+            upper_bound_mask = mx.full((N, M), True)
+        else:
+            upper_bound_mask = key_indices <= (query_indices + window_size[1])
+
+        sliding_window_mask = lower_bound_mask & upper_bound_mask
+        sliding_window_mask = mx.where(sliding_window_mask, 0.0, float("-inf"))
+
+        if mask is not None:
+            mask = mask + sliding_window_mask
+        else:
+            mask = sliding_window_mask
+
+    o = mx.zeros((N, D_v), dtype=q.dtype)
+    l = mx.zeros((N,), dtype=q.dtype)
+    m = mx.full((N,), -mx.inf, dtype=q.dtype)
+
+    B_c = min(128, M)
+    B_r = min(128, N)
+
+    for j in range(0, M, B_c):
+        j_end = min(j + B_c, M)
+        k_j = k[j:j_end, :]
+        v_j = v[j:j_end, :]
+
+        for i in range(0, N, B_r):
+            i_end = min(i + B_r, N)
+            q_i = q[i:i_end, :]
+            m_i = m[i:i_end]
+            l_i = l[i:i_end]
+
+            s_ij = (q_i @ k_j.T) * scale
+
+            if mask is not None:
+                s_ij = s_ij + mask[i:i_end, j:j_end]
+
+            m_i_new = mx.maximum(m_i, mx.max(s_ij, axis=-1))
+            p_ij = mx.exp(s_ij - m_i_new[:, None])
+
+            l_i_new = mx.exp(m_i - m_i_new) * l_i + mx.sum(p_ij, axis=-1)
+
+            o_i = o[i:i_end, :]
+            o[i:i_end] = (l_i[:, None] / l_i_new[:, None]) * mx.exp(m_i - m_i_new)[:, None] * o_i + (p_ij @ v_j)
+
+            m[i:i_end] = m_i_new
+            l[i:i_end] = l_i_new
+
+    L = m + mx.log(l)
+    return o, L
+
+def flash_attention_varlen_forward(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    cu_seqlens_q: mx.array,
+    cu_seqlens_k: mx.array,
+    scale: float,
+    causal: bool = False,
+    window_size: Tuple[int, int] = (-1, -1),
+):
+    B = len(cu_seqlens_q) - 1
+    o = mx.zeros_like(q)
+
+    for i in range(B):
+        q_start, q_end = cu_seqlens_q[i], cu_seqlens_q[i+1]
+        k_start, k_end = cu_seqlens_k[i], cu_seqlens_k[i+1]
+
+        q_i = q[q_start:q_end]
+        k_i = k[k_start:k_end]
+        v_i = v[k_start:k_end]
+
+        o_i, _ = _flash_attention_varlen_single(q_i, k_i, v_i, scale, causal, window_size)
+        o[q_start:q_end] = o_i
+
+    return o
 
 def flash_attention_backward(
     q: mx.array,

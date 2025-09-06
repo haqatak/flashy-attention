@@ -5,6 +5,7 @@ from mlx_flash_attention import FlashAttention
 from mlx_flash_attention.attention import (
     flash_attention_forward,
     flash_attention_backward,
+    flash_attention_varlen_forward,
 )
 
 
@@ -117,59 +118,43 @@ def test_flash_attention_mask():
     assert mx.allclose(o_flash, o_standard, atol=1e-5, rtol=1e-6)
 
 
-def standard_multi_head_attention(
-    q, k, v, d_model, num_heads, scale, q_proj, k_proj, v_proj, out_proj, mask=None, causal=False, q_scale=1.0
-):
-    d_head = d_model // num_heads
-    B, N, D = q.shape
-    _, M, _ = k.shape
-
-    # Project and split heads
-    q = q_proj(q).reshape(B, N, num_heads, d_head).transpose(0, 2, 1, 3)
-    if q_scale != 1.0:
-        q = q * q_scale
-    k = k_proj(k).reshape(B, M, num_heads, d_head).transpose(0, 2, 1, 3)
-    v = v_proj(v).reshape(B, M, num_heads, d_head).transpose(0, 2, 1, 3)
-
-    # Standard attention
-    if causal:
-        mask = np.triu(np.full((N, N), -1e9), 1)
-        mask = mx.array(mask)
-
+def standard_attention_4d(q, k, v, scale, mask=None):
+    # q, k, v are (B, num_heads, N, head_dim)
+    s = (q @ k.transpose(0, 1, 3, 2)) * scale
     if mask is not None:
-        mask = mx.expand_dims(mask, 1)
-        mask = mx.broadcast_to(mask, (B, num_heads, N, M))
-
-    output = standard_attention(q, k, v, scale, mask=mask)
-
-    # Reshape and project back
-    output = output.transpose(0, 2, 1, 3).reshape(B, N, D)
-    return out_proj(output)
-
+        s = s + mask
+    p = mx.softmax(s, axis=-1)
+    return p @ v
 
 def test_multi_head_flash_attention():
     B = 1
     N = 256
-    D = 128
     num_heads = 4
+    head_dim = 32
 
-    q = mx.random.normal((B, N, D))
-    k = mx.random.normal((B, N, D))
-    v = mx.random.normal((B, N, D))
-    scale = 1.0 / np.sqrt(D // num_heads)
+    q = mx.random.normal((B, N, num_heads, head_dim))
+    k = mx.random.normal((B, N, num_heads, head_dim))
+    v = mx.random.normal((B, N, num_heads, head_dim))
+    scale = 1.0 / np.sqrt(head_dim)
 
     # Flash attention
-    flash_attention = FlashAttention(D, num_heads)
+    flash_attention = FlashAttention(num_heads, head_dim)
     o_flash = flash_attention(q, k, v)
 
     # Standard multi-head attention
-    o_standard = standard_multi_head_attention(
-        q, k, v, D, num_heads, scale,
-        flash_attention.q_proj, flash_attention.k_proj, flash_attention.v_proj, flash_attention.out_proj,
-        q_scale=1.0
-    )
+    q_t = q.transpose(0, 2, 1, 3)
+    k_t = k.transpose(0, 2, 1, 3)
+    v_t = v.transpose(0, 2, 1, 3)
 
-    # Check that the outputs are close
+    o_standard_4d = standard_attention_4d(q_t, k_t, v_t, scale)
+    o_standard_4d = o_standard_4d.transpose(0, 2, 1, 3).reshape(B, N, num_heads * head_dim)
+
+    out_proj_standard = nn.Linear(num_heads * head_dim, num_heads * head_dim)
+    out_proj_standard.weight = flash_attention.out_proj.weight
+    out_proj_standard.bias = flash_attention.out_proj.bias
+
+    o_standard = out_proj_standard(o_standard_4d)
+
     assert mx.allclose(o_flash, o_standard, atol=1e-5, rtol=1e-6)
 
 
@@ -203,15 +188,15 @@ def test_variable_length_attention():
 def test_dropout():
     B = 1
     N = 256
-    D = 128
     num_heads = 4
+    head_dim = 32
     dropout_p = 0.5
 
-    q = mx.random.normal((B, N, D))
-    k = mx.random.normal((B, N, D))
-    v = mx.random.normal((B, N, D))
+    q = mx.random.normal((B, N, num_heads, head_dim))
+    k = mx.random.normal((B, N, num_heads, head_dim))
+    v = mx.random.normal((B, N, num_heads, head_dim))
 
-    flash_attention = FlashAttention(D, num_heads, dropout_p=dropout_p)
+    flash_attention = FlashAttention(num_heads, head_dim, dropout_p=dropout_p)
 
     # Eval mode
     flash_attention.eval()
@@ -227,25 +212,34 @@ def test_dropout():
 def test_query_scaling():
     B = 1
     N = 256
-    D = 128
     num_heads = 4
+    head_dim = 32
     q_scale = 2.0
 
-    q = mx.random.normal((B, N, D))
-    k = mx.random.normal((B, N, D))
-    v = mx.random.normal((B, N, D))
-    scale = 1.0 / np.sqrt(D // num_heads)
+    q = mx.random.normal((B, N, num_heads, head_dim))
+    k = mx.random.normal((B, N, num_heads, head_dim))
+    v = mx.random.normal((B, N, num_heads, head_dim))
+    scale = 1.0 / np.sqrt(head_dim)
 
     # Flash attention
-    flash_attention = FlashAttention(D, num_heads)
+    flash_attention = FlashAttention(num_heads, head_dim)
     o_flash = flash_attention(q, k, v, q_scale=q_scale)
 
     # Standard multi-head attention with scaled queries
-    o_standard = standard_multi_head_attention(
-        q, k, v, D, num_heads, scale,
-        flash_attention.q_proj, flash_attention.k_proj, flash_attention.v_proj, flash_attention.out_proj,
-        q_scale=q_scale
-    )
+    q_t = q.transpose(0, 2, 1, 3)
+    k_t = k.transpose(0, 2, 1, 3)
+    v_t = v.transpose(0, 2, 1, 3)
+
+    q_t_scaled = q_t * q_scale
+
+    o_standard_4d = standard_attention_4d(q_t_scaled, k_t, v_t, scale)
+    o_standard_4d = o_standard_4d.transpose(0, 2, 1, 3).reshape(B, N, num_heads * head_dim)
+
+    out_proj_standard = nn.Linear(num_heads * head_dim, num_heads * head_dim)
+    out_proj_standard.weight = flash_attention.out_proj.weight
+    out_proj_standard.bias = flash_attention.out_proj.bias
+
+    o_standard = out_proj_standard(o_standard_4d)
 
     # Check that the outputs are close
     assert mx.allclose(o_flash, o_standard, atol=1e-5, rtol=1e-6)
@@ -279,17 +273,84 @@ def test_sliding_window_attention():
 def test_mixed_precision():
     B = 1
     N = 256
-    D = 128
     num_heads = 4
+    head_dim = 32
 
-    q = mx.random.normal((B, N, D))
-    k = mx.random.normal((B, N, D))
-    v = mx.random.normal((B, N, D))
+    q = mx.random.normal((B, N, num_heads, head_dim))
+    k = mx.random.normal((B, N, num_heads, head_dim))
+    v = mx.random.normal((B, N, num_heads, head_dim))
 
-    flash_attention = FlashAttention(D, num_heads, dtype=mx.bfloat16)
+    flash_attention = FlashAttention(num_heads, head_dim, dtype=mx.bfloat16)
     o = flash_attention(q, k, v)
     assert o.dtype == mx.bfloat16
 
+
+def test_flash_attention_varlen():
+    B = 2
+    N = 256
+    M = 256
+    D = 64
+
+    q_lens = mx.array([128, 200])
+    k_lens = mx.array([100, 256])
+
+    q = mx.random.normal((q_lens.sum().item(), D))
+    k = mx.random.normal((k_lens.sum().item(), D))
+    v = mx.random.normal((k_lens.sum().item(), D))
+
+    cu_seqlens_q = mx.concatenate([mx.array([0]), mx.cumsum(q_lens)])
+    cu_seqlens_k = mx.concatenate([mx.array([0]), mx.cumsum(k_lens)])
+
+    scale = 1.0 / np.sqrt(D)
+
+    # Run flash attention varlen
+    o_flash = flash_attention_varlen_forward(q, k, v, cu_seqlens_q, cu_seqlens_k, scale)
+
+    # Run standard attention on padded tensors
+    q_padded = mx.zeros((B, N, D))
+    k_padded = mx.zeros((B, M, D))
+    v_padded = mx.zeros((B, M, D))
+
+    for i in range(B):
+        q_padded[i, :q_lens[i]] = q[cu_seqlens_q[i]:cu_seqlens_q[i+1]]
+        k_padded[i, :k_lens[i]] = k[cu_seqlens_k[i]:cu_seqlens_k[i+1]]
+        v_padded[i, :k_lens[i]] = v[cu_seqlens_k[i]:cu_seqlens_k[i+1]]
+
+    q_mask = mx.arange(N)[None, :] < q_lens[:, None]
+    k_mask = mx.arange(M)[None, :] < k_lens[:, None]
+    mask = q_mask[:, :, None] * k_mask[:, None, :]
+    mask = mx.where(mask, 0.0, -1e9)
+
+    o_standard, _ = flash_attention_forward(q_padded, k_padded, v_padded, mask=mask, scale=scale)
+
+    # Compare the non-padded parts
+    for i in range(B):
+        o_flash_i = o_flash[cu_seqlens_q[i]:cu_seqlens_q[i+1]]
+        o_standard_i = o_standard[i, :q_lens[i]]
+        assert mx.allclose(o_flash_i, o_standard_i, atol=1e-5, rtol=1e-6)
+
+def test_deterministic_mode():
+    B = 1
+    N = 256
+    num_heads = 4
+    head_dim = 32
+    dropout_p = 0.5
+
+    q = mx.random.normal((B, N, num_heads, head_dim))
+    k = mx.random.normal((B, N, num_heads, head_dim))
+    v = mx.random.normal((B, N, num_heads, head_dim))
+
+    flash_attention = FlashAttention(num_heads, head_dim, dropout_p=dropout_p)
+
+    # Deterministic
+    o1 = flash_attention(q, k, v, deterministic=True)
+    o2 = flash_attention(q, k, v, deterministic=True)
+    assert mx.allclose(o1, o2)
+
+    # Non-deterministic
+    o3 = flash_attention(q, k, v, deterministic=False)
+    o4 = flash_attention(q, k, v, deterministic=False)
+    assert not mx.allclose(o3, o4)
 
 if __name__ == "__main__":
     test_flash_attention_forward()
@@ -302,3 +363,5 @@ if __name__ == "__main__":
     test_query_scaling()
     test_sliding_window_attention()
     test_mixed_precision()
+    test_flash_attention_varlen()
+    test_deterministic_mode()
